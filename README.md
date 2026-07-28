@@ -100,3 +100,18 @@ at the top of the script — edit it to match your machine's GPU count.
 ```bash
 bash scripts/run.sh MicroLens
 ```
+
+---
+## Citation
+
+If you find our work is useful for your research, please consider citing:
+
+```bibtex
+@inproceedings{lin2026verifiable,
+  title={Verifiable Reasoning for LLM-based Generative Recommendation},
+  author={Lin, Xinyu and Zeng, Hanqing and Yu, Hanchao and Xia, Yinglong and Zhang, Jiang and Singh, Aashu and Liu, Fei and Wang, Wenjie and Feng, Fuli and Chua, Tat-Seng and others},
+  booktitle={Proceedings of the 49th International ACM SIGIR Conference on Research and Development in Information Retrieval},
+  pages={1118--1129},
+  year={2026}
+}
+```

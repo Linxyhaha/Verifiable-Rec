@@ -13,7 +13,7 @@ from transformers import (
     DataCollatorForSeq2Seq,
 )
 
-from layers import LatentModel, LatentModel_MS
+from layers import LatentModel_MS
 from reasoning_dataset import LatentRDataset
 # torch.backends.cuda.enable_cudnn_sdp(False)
 import ipdb

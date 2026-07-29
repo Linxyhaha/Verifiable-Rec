@@ -39,7 +39,7 @@ class SelfAttentionLayer(torch.nn.Module):
         # if set to -1, all of hidden_states needed
         self.end_k = end_k
 
-        # 定义Q, K, V的线性变换层
+        # define linear projections for Q, K, V
         self.query = nn.Linear(hidden_size, hidden_size)
         self.key = nn.Linear(hidden_size, hidden_size)
         self.value = nn.Linear(hidden_size, hidden_size)
@@ -54,26 +54,17 @@ class SelfAttentionLayer(torch.nn.Module):
             raise ValueError("attention_mask must have the same size as thought_id_idx")
 
         if end_k != -1:
-            # 把thought_id前end_k个位置的内容考虑进去
-            # 这里的代码有一点问题：也就是我们认为end_k不会长过前面的句子长度
-            # 否则会把padding的部分置为1
+
             for i in range(attention_mask.size(0)):
                 idx = thought_id_idx[i].item()
                 start_idx = max(0, idx - end_k)
                 attention_mask[i].zero_()
                 attention_mask[i, start_idx:idx] = 1
         else:
-            # 把thought_id前所有的内容都考虑进去 (要屏蔽padding和thought_id后面的部分)
-            # 这里想一下
-            # 在训练的时候，padding在右侧
-            # 在推理的时候，padding在左侧
-            # 而在推理的时候，我们传进来的attention_mask实际上是正确的，所以不需要全部置0
-            # 训练时候，代码可以改为: attention_mask[i, idx:] = 0
-            # 推理时候, idx == seq_len, 也是可以和训练时候一样去改，所以修改
+
             for i in range(attention_mask.size(0)):
                 idx = thought_id_idx[i].item()
                 attention_mask[i, idx:] = 0
-            # TODO: 这个地方的attention mask的操作？为什么是thought_idx这个地方? n_thought == 1: n_thought这个地方是看不到自己的，
 
         # Convert mask to weights: 1 -> 0, 0 -> -inf
         attention_weight = torch.zeros_like(attention_mask, dtype=torch.float32)
@@ -82,7 +73,6 @@ class SelfAttentionLayer(torch.nn.Module):
 
     def forward(self, hidden_states: torch.Tensor, attention_mask: torch.Tensor,
                 thought_id_idx) -> torch.Tensor:
-        # ipdb.set_trace() # TODO: check hidden state (bs, seq_len, dim), attention_mask (bs, seq_len), thought_id_idx (bs,) - column idx
         # hidden_states = hidden_states.to(torch.float32)
         attention_mask = SelfAttentionLayer.mask_to_weights(attention_mask.clone(), thought_id_idx, self.end_k) # (bs, seq_len)
 
@@ -93,33 +83,30 @@ class SelfAttentionLayer(torch.nn.Module):
 
         batch_size, seq_len, _ = hidden_states.shape
 
-        # 生成Q, K, V
         Q = self.query(hidden_states)  # [batch_size, seq_len, embed_dim]
         K = self.key(hidden_states)
         V = self.value(hidden_states)
 
-        # 加入位置编码
         Q, K = apply_rotary_pos_emb(Q, K, cos.squeeze(0), sin.squeeze(0), unsqueeze_dim=0)
 
-        # 确定目标位置索引
         if thought_id_idx is None:
-            # 取每个样本的最后一个位置（seq_len - 1）
+            # take the last position (seq_len - 1) for each sample
             indices = torch.full((batch_size,), seq_len - 1, device=hidden_states.device)
         else:
             indices = thought_id_idx - 1
             if (indices < 0).any() or (indices >= seq_len).any():
                 raise ValueError("thought_id_idx-1 exceeds valid sequence indices")
 
-        # 提取目标位置的Q向量 [batch_size, 1, embed_dim]
+        # extract the Q vector at the target position [batch_size, 1, embed_dim]
         Q_selected = Q[torch.arange(batch_size), indices].unsqueeze(1)
 
-        # 计算注意力分数 [batch_size, 1, seq_len]
+        # compute attention scores [batch_size, 1, seq_len]
         attn_scores = torch.matmul(Q_selected, K.transpose(-2, -1)) * self.scale_score
 
-        # 应用attention_mask（形状需匹配为[batch_size, 1, seq_len]）
-        attn_scores += attention_mask.unsqueeze(1)  # 广播至[batch_size, 1, seq_len]
+        # apply attention_mask (shape must match [batch_size, 1, seq_len])
+        attn_scores += attention_mask.unsqueeze(1)  # broadcast to [batch_size, 1, seq_len]
 
-        # 计算注意力权重与输出
+        # compute attention weights and output
         attn_weights = F.softmax(attn_scores, dim=-1)
         output_selected = torch.matmul(attn_weights, V)  # [batch_size, 1, embed_dim]
         output = output_selected.squeeze(1) # [batch_size, embed_dim]
@@ -129,9 +116,9 @@ class SelfAttentionLayer(torch.nn.Module):
 class Noise(nn.Module):
     def __init__(self, hidden_size):
         super(Noise, self).__init__()
-        # 这里的初始化就放在from_pretrained之后去做
-        # 对于 log_var  model.mlp.log_var = torch.nn.Parameter(torch.tensor([float('-inf')] * model.config.hidden_size))
-        # 对于 mu       nn.init.eyes
+        # this initialization is done after from_pretrained
+        # for log_var:  model.mlp.log_var = torch.nn.Parameter(torch.tensor([float('-inf')] * model.config.hidden_size))
+        # for mu:       nn.init.eyes
         self.mu = nn.Linear(hidden_size, hidden_size, bias=False)
         self.log_var = torch.nn.Parameter(torch.tensor([float('-10')] * hidden_size))
 
@@ -139,68 +126,6 @@ class Noise(nn.Module):
         x = self.mu(x)
         std = torch.exp(self.log_var / 2)
         return x + torch.randn_like(x).mul(std)
-
-
-class LatentModel(Qwen2ForCausalLM):
-
-    def __init__(self, config):
-        super().__init__(config)
-        # self.mlp = Noise(config.hidden_size)
-        self.attention = SelfAttentionLayer(config.hidden_size)
-
-    def generate_embs(self, input_ids, attention_mask):
-        output_mid = super().forward(input_ids=input_ids, attention_mask=attention_mask, output_hidden_states=True) 
-        # generate embeddings
-        thought_ids = self.model.embed_tokens.num_embeddings - 1  # thought id flag
-        where_thought_ids = torch.nonzero(input_ids == thought_ids)
-        hidden_states = output_mid['hidden_states']
-        input_embs = self.model.embed_tokens(input_ids)
-        # ipdb.set_trace() # attention mask (bs, seq_len)
-        input_embs[where_thought_ids[:, 0], where_thought_ids[:, 1]] = self.attention(
-            hidden_states=hidden_states[-1], attention_mask=attention_mask,
-            thought_id_idx=where_thought_ids[:, 1],
-        ).to(input_embs.dtype)
-
-        return input_embs
-
-
-    def forward(
-        self,
-        input_ids: torch.LongTensor = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        past_key_values = None,
-        inputs_embeds: Optional[torch.FloatTensor] = None,
-        labels: Optional[torch.LongTensor] = None,
-        use_cache: Optional[bool] = None,
-        output_attentions: Optional[bool] = None,
-        output_hidden_states: Optional[bool] = None,
-        return_dict: Optional[bool] = None,
-        cache_position: Optional[torch.LongTensor] = None,
-        num_logits_to_keep: int = 0,
-        **kwargs,
-    ) -> Union[Tuple, CausalLMOutputWithPast]:
-        if input_ids is not None and inputs_embeds is None and input_ids.size() == attention_mask.size():
-            inputs_embeds = self.generate_embs(input_ids, attention_mask)
-            input_ids = None
-        # elif input_ids is not None and inputs_embeds is None and input_ids.size()!=attention_mask.size():
-            # 这个时候是在做生成任务，已经有了cache所以用input_ids即可
-        ipdb.set_trace()
-        return super().forward(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            past_key_values=past_key_values,
-            inputs_embeds=inputs_embeds,
-            labels=labels,
-            use_cache=use_cache,
-            output_attentions=output_attentions,
-            output_hidden_states=output_hidden_states,
-            return_dict=return_dict,
-            cache_position=cache_position,
-            num_logits_to_keep=num_logits_to_keep,
-            **kwargs,
-        )
 
 
 class LatentModel_MS(Qwen2ForCausalLM):
@@ -225,6 +150,7 @@ class LatentModel_MS(Qwen2ForCausalLM):
         hidden_states = output_mid['hidden_states']
         input_embs = self.model.embed_tokens(input_ids) if input_embeds is None else input_embeds
 
+        # reasoning step: reasoning representation r_t via self-attention over history (Eq. 1)
         input_embs[where_thought_ids[:, 0], where_thought_ids[:, 1]] = self.attention(
             hidden_states=hidden_states[-1], attention_mask=attention_mask,
             thought_id_idx=where_thought_ids[:, 1],
@@ -254,9 +180,9 @@ class LatentModel_MS(Qwen2ForCausalLM):
         **kwargs,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
         
-        # 单步reasoning实现逻辑 - 拿thought token之前的最后一个latent hidden state，替换掉thought token的embedding，取最后的hidden state
-        # 多部reasoning实现逻辑 - 训练：每次替换之后，要把thought_idx + 1, 然后，在后面加一列padding，随后更新attention_mask，老的thought_idx位置 置1，后面不变. 更新input_embeds, 把原来thought_idx以及之后的input_embeds（替换latent hidden state到旧thought token之前）放到 新的thought_idx 以及之后的位置，还要更新labels
-        # 多部reasoning实现逻辑 - inference：kv cache需要保留，只用最新的input_ids, attention_mask 和 cache position在外部更新时需要调整更改
+        # single-step reasoning: take the last latent hidden state before the thought token to replace the thought token's embedding, then take the final hidden state
+        # multi-step reasoning (training): after each replacement, increment thought_idx by 1, then append a new padding column, then update attention_mask (set the old thought_idx position to 1, leave the rest unchanged). Update input_embeds by shifting the embeddings from the old thought_idx onward to the new thought_idx position, and update labels accordingly
+        # multi-step reasoning (inference): keep the kv cache, only use the latest input_ids; attention_mask and cache_position need to be adjusted externally when updated
         
         device = input_ids.device
 

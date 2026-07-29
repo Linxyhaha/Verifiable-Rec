@@ -81,7 +81,7 @@ class SelfAttentionLayer(torch.nn.Module):
 
         batch_size, seq_len, _ = hidden_states.shape
 
-        # 生成Q, K, V
+        # generate Q, K, V
         Q = self.query(hidden_states)  # [batch_size, seq_len, embed_dim]
         K = self.key(hidden_states)
         V = self.value(hidden_states)
@@ -89,7 +89,7 @@ class SelfAttentionLayer(torch.nn.Module):
         Q, K = apply_rotary_pos_emb(Q, K, cos.squeeze(0), sin.squeeze(0), unsqueeze_dim=0)
 
         if thought_id_idx is None:
-            # （seq_len - 1）
+            # take the last position (seq_len - 1) for each sample
             indices = torch.full((batch_size,), seq_len - 1, device=hidden_states.device)
         else:
             indices = thought_id_idx - 1
@@ -550,6 +550,7 @@ class LatentModelwithVerifier_RATT(Qwen2ForCausalLM):
     '''
     def __init__(self, config):
         super().__init__(config)
+        # verifier heads for group-level preference prediction (Eq. 7)
         self.verifiers = nn.ModuleList([nn.Linear(config.hidden_size, config.num_category) for _ in range(config.num_verifier)])
         self.num_verifier = config.num_verifier
         self.num_category = config.num_category 
@@ -668,8 +669,8 @@ class LatentModelwithVerifier_RATT(Qwen2ForCausalLM):
             output_logits = []
             for v_idx in range(self.num_verifier):
                 output_logits.append(self.verifiers[v_idx](thought_embeds)) # (bs, 1, n_cat)
-            
-            output_logits = torch.cat(output_logits, dim=1) # (bs, n_verifier, n_cat) 
+
+            output_logits = torch.cat(output_logits, dim=1) # (bs, n_verifier, n_cat)
             output_logits = output_logits.view(-1, self.num_category) # (bs*n_verifier, n_cat)
 
             v_loss = 0
@@ -677,6 +678,7 @@ class LatentModelwithVerifier_RATT(Qwen2ForCausalLM):
                 v_labels = kwargs["category_label"]
                 v_labels = v_labels.repeat(self.num_verifier)  # (bs*n_verifier, )
                 loss_func = nn.CrossEntropyLoss()
+                # verifier pre-training loss (Eq. 11)
                 v_loss = loss_func(output_logits, v_labels)
         
         return CausalLMOutputWithPast(

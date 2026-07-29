@@ -102,7 +102,7 @@ class SelfAttentionLayer(torch.nn.Module):
 
         attn_scores = torch.matmul(Q_selected, K.transpose(-2, -1)) * self.scale_score
 
-        attn_scores += attention_mask.unsqueeze(1)  # 广播至[batch_size, 1, seq_len]
+        attn_scores += attention_mask.unsqueeze(1)  # broadcast to [batch_size, 1, seq_len]
 
         attn_weights = F.softmax(attn_scores, dim=-1)
         output_selected = torch.matmul(attn_weights, V)  # [batch_size, 1, embed_dim]
@@ -121,168 +121,6 @@ class Noise(nn.Module):
         std = torch.exp(self.log_var / 2)
         return x + torch.randn_like(x).mul(std)
 
-
-class LatentModel(Qwen2ForCausalLM):
-
-    def __init__(self, config):
-        super().__init__(config)
-        # self.mlp = Noise(config.hidden_size)
-        self.attention = SelfAttentionLayer(config.hidden_size)
-
-    def generate_embs(self, input_ids, attention_mask):
-        output_mid = super().forward(input_ids=input_ids, attention_mask=attention_mask, output_hidden_states=True) 
-        # generate embeddings
-        thought_ids = self.model.embed_tokens.num_embeddings - 1  # thought id flag
-        where_thought_ids = torch.nonzero(input_ids == thought_ids)
-        hidden_states = output_mid['hidden_states']
-        input_embs = self.model.embed_tokens(input_ids)
-        # ipdb.set_trace() # attention mask (bs, seq_len)
-        input_embs[where_thought_ids[:, 0], where_thought_ids[:, 1]] = self.attention(
-            hidden_states=hidden_states[-1], attention_mask=attention_mask,
-            thought_id_idx=where_thought_ids[:, 1],
-        ).to(input_embs.dtype)
-
-        return input_embs
-
-    def forward(
-        self,
-        input_ids: torch.LongTensor = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        past_key_values = None,
-        inputs_embeds: Optional[torch.FloatTensor] = None,
-        labels: Optional[torch.LongTensor] = None,
-        use_cache: Optional[bool] = None,
-        output_attentions: Optional[bool] = None,
-        output_hidden_states: Optional[bool] = None,
-        return_dict: Optional[bool] = None,
-        cache_position: Optional[torch.LongTensor] = None,
-        num_logits_to_keep: int = 0,
-        **kwargs,
-    ) -> Union[Tuple, CausalLMOutputWithPast]:
-        if input_ids is not None and inputs_embeds is None and input_ids.size() == attention_mask.size():
-            inputs_embeds = self.generate_embs(input_ids, attention_mask)
-            input_ids = None
-        # elif input_ids is not None and inputs_embeds is None and input_ids.size()!=attention_mask.size():
-            # 这个时候是在做生成任务，已经有了cache所以用input_ids即可
-        return super().forward(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            past_key_values=past_key_values,
-            inputs_embeds=inputs_embeds,
-            labels=labels,
-            use_cache=use_cache,
-            output_attentions=output_attentions,
-            output_hidden_states=output_hidden_states,
-            return_dict=return_dict,
-            cache_position=cache_position,
-            num_logits_to_keep=num_logits_to_keep,
-            **kwargs,
-        )
-
-
-class LatentModelwithVerifier(Qwen2ForCausalLM):
-    '''
-        how to ensure diversity? 
-    '''
-    def __init__(self, config):
-        super().__init__(config)
-        self.verifiers = nn.ModuleList([nn.Linear(config.hidden_size, config.num_category) for _ in range(config.num_verifier)])
-        self.num_verifier = config.num_verifier
-        self.num_category = config.num_category 
-        # self.query_vector = nn.Embedding(self.num_verifier, self.num_category)
-
-    def cal_consistency():
-        pass 
-
-    def forward(
-        self,
-        input_ids: torch.LongTensor = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[Union[Cache, List[torch.FloatTensor]]] = None,
-        inputs_embeds: Optional[torch.FloatTensor] = None,
-        labels: Optional[torch.LongTensor] = None,
-        use_cache: Optional[bool] = None,
-        output_attentions: Optional[bool] = None,
-        output_hidden_states: Optional[bool] = None,
-        return_dict: Optional[bool] = None,
-        cache_position: Optional[torch.LongTensor] = None,
-        logits_to_keep: Union[int, torch.Tensor] = 0,
-        **kwargs,
-    ) -> Union[Tuple, CausalLMOutputWithPast]:
-      
-        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
-        output_hidden_states = (
-            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
-        )
-        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
-
-        # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
-        outputs = self.model(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            past_key_values=past_key_values,
-            inputs_embeds=inputs_embeds,
-            use_cache=use_cache,
-            output_attentions=output_attentions,
-            output_hidden_states=output_hidden_states,
-            return_dict=return_dict,
-            cache_position=cache_position,
-            **kwargs,
-        )
-
-        hidden_states = outputs[0]
-        # Only compute necessary logits, and do not upcast them to float if we are not computing the loss
-        slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
-        logits = self.lm_head(hidden_states[:, slice_indices, :])
-
-        loss = None
-        if labels is not None:
-            loss = self.loss_function(logits=logits, labels=labels, vocab_size=self.config.vocab_size, **kwargs)
-
-        if not return_dict:
-            output = (logits,) + outputs[1:]
-            return (loss,) + output if loss is not None else output
-        
-        # train verifiers
-        # ipdb.set_trace()
-        prefix_end_ids = kwargs["prefix_end_id"]
-        last_hidden_states = hidden_states[torch.arange(input_ids.shape[0]).to(input_ids.device), prefix_end_ids].unsqueeze(1) # (bs, 1, dim)
-        output_logits = []
-        
-        for v_idx in range(self.num_verifier):
-            output_logits.append(self.verifiers[v_idx](last_hidden_states)) # (bs, 1, n_cat)
-        
-        # ipdb.set_trace()
-        output_logits = torch.cat(output_logits, dim=1) # (bs, n_verifier, n_cat) 
-        output_logits = output_logits.view(-1, self.num_category) # (bs*n_verifier, n_cat)
-        v_labels = kwargs["category_label"]
-        v_labels = v_labels.repeat(self.num_verifier)  # (bs*n_verifier, )
-        loss_func = nn.CrossEntropyLoss()
-
-        v_loss = loss_func(output_logits, v_labels)
-        # div_loss = self.contrastive_loss(output_logits, output_logits)
-        loss += v_loss
-
-        return CausalLMOutputWithPast(
-            loss=loss,
-            logits=logits,
-            past_key_values=outputs.past_key_values,
-            hidden_states=outputs.hidden_states,
-            attentions=outputs.attentions,
-        )
-    
-    def contrastive_loss(rep_view1, rep_view2, temperature=1):
-        rep_view1 = F.normalize(rep_view1, dim=1)
-        rep_view2 = F.normalize(rep_view2, dim=1)
-        sim_matrix = torch.matmul(rep_view1, rep_view2.T) / temperature
-        labels = torch.arange(rep_view1.shape[0], device=rep_view1.device)
-        loss_func = nn.CrossEntropyLoss()
-        loss = loss_func(sim_matrix, labels)
-        return loss
 
 class LatentModel_MS(Qwen2ForCausalLM):
 
@@ -330,9 +168,9 @@ class LatentModel_MS(Qwen2ForCausalLM):
         **kwargs,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
         
-        # 单步reasoning实现逻辑 - 拿thought token之前的最后一个latent hidden state，替换掉thought token的embedding，取最后的hidden state
-        # 多部reasoning实现逻辑 - 训练：每次替换之后，要把thought_idx + 1, 然后，在后面加一列padding，随后更新attention_mask，老的thought_idx位置 置1，后面不变. 更新input_embeds, 把原来thought_idx以及之后的input_embeds（替换latent hidden state到旧thought token之前）放到 新的thought_idx 以及之后的位置，还要更新labels
-        # 多部reasoning实现逻辑 - inference：kv cache需要保留，只用最新的input_ids, attention_mask 和 cache position在外部更新时需要调整更改
+        # single-step reasoning: take the last latent hidden state before the thought token to replace the thought token's embedding, then take the final hidden state
+        # multi-step reasoning (training): after each replacement, increment thought_idx by 1, then append a new padding column, then update attention_mask (set the old thought_idx position to 1, leave the rest unchanged). Update input_embeds by shifting the embeddings from the old thought_idx onward to the new thought_idx position, and update labels accordingly
+        # multi-step reasoning (inference): keep the kv cache, only use the latest input_ids; attention_mask and cache_position need to be adjusted externally when updated
         
         device = input_ids.device
 
@@ -669,7 +507,7 @@ class LatentModel_MS(Qwen2ForCausalLM):
         # update past_key_values keeping its naming used in model code
         for possible_cache_name in ALL_CACHE_NAMES:
             if possible_cache_name in outputs:
-                # TODO (joao): remove output/input mismatch when these old models (xlnet, reformer) are deprecated
+                # (joao): remove output/input mismatch when these old models (xlnet, reformer) are deprecated
                 if possible_cache_name in ("past_buckets_states", "mems"):
                     cache_name = "past_key_values"
                 else:
@@ -708,152 +546,6 @@ class LatentModel_MS(Qwen2ForCausalLM):
             model_kwargs["cache_position"] = torch.cat((past_positions, new_positions))
         return model_kwargs
     
-
-class LatentModel_MS_withVerifier(LatentModel_MS):
-    '''
-        This one has no RATT
-    '''
-    def __init__(self, config):
-        super().__init__(config)
-        self.verifiers = nn.ModuleList([nn.Linear(config.hidden_size, config.num_category) for _ in range(config.num_verifier)])
-        self.num_verifier = config.num_verifier
-        self.num_category = config.num_category 
-        del self.attention
-        
-
-    def verify(self, thought_embeds, strategy="max"):
-        '''
-            input: thought embedding
-            output: weight, guidance emb
-        '''
-        v_logits = []
-        for v_idx, v in enumerate(self.verifiers):
-            logit = v(thought_embeds)
-            v_logits.append(logit.unsqueeze(0))
-        v_logits = torch.cat(v_logits, dim=0) # (n_verifier, bs, n_cat)
-
-        v_probs = F.softmax(v_logits, dim=-1) # (n_verifier, bs, n_cat)
-        entropy = -torch.sum(v_probs * torch.log(v_probs + 1e-12), dim=-1)  # (n_verifier, bs)
-        max_entropy = torch.log(torch.tensor(v_probs.size(-1), dtype=torch.float, device=v_probs.device))
-        weight = torch.mean(entropy / max_entropy, dim=0)  # (bs,)
-        if strategy == "max":
-            # verifier average
-            v_probs_mean = v_probs.mean(dim=0)  # (bs, n_cat) 
-            max_prob, max_prob_idx = v_probs_mean.max(dim=-1)  # (bs,)
-            # print("*** max prob", max_prob)
-            # guidance embedding
-            weight_matrix = self.verifiers[0].weight  # (n_cat, dim) 
-            guidance_emb = weight_matrix[max_prob_idx]  # (bs, dim)
-        
-        elif strategy == "mean":
-            guidance_emb = torch.mean(self.verifier.weight, dim=1)
-        return weight, guidance_emb
-
-    def generate_embs(self, input_ids, input_embeds, attention_mask):
-        
-        if input_ids is not None and input_embeds is None:
-            output_mid = Qwen2ForCausalLM.forward(self, input_ids=input_ids, attention_mask=attention_mask, output_hidden_states=True)
-        elif input_embeds is not None:
-            output_mid = Qwen2ForCausalLM.forward(self, inputs_embeds=input_embeds, attention_mask=attention_mask, output_hidden_states=True)
-        
-        # generate embeddings
-        thought_ids = self.model.embed_tokens.num_embeddings - 1  # thought id flag
-        where_thought_ids = torch.nonzero(input_ids == thought_ids)
-
-        hidden_states = output_mid['hidden_states'][-1] # (bs, seq_len, dim)
-        weight, guidance_emb = self.verify(hidden_states[where_thought_ids[:,0], where_thought_ids[:,1]-1], strategy="max")
-
-        input_embs = self.model.embed_tokens(input_ids) if input_embeds is None else input_embeds
-        # input_embs[where_thought_ids[:, 0], where_thought_ids[:, 1]] = (1-weight.unsqueeze(1).to(dtype=input_embs.dtype)) * hidden_states[where_thought_ids[:,0], where_thought_ids[:,1]-1] + weight.unsqueeze(1).to(dtype=input_embs.dtype) * guidance_emb
-        input_embs[where_thought_ids[:, 0], where_thought_ids[:, 1]] = hidden_states[where_thought_ids[:,0], where_thought_ids[:,1]-1]
-        return input_embs, where_thought_ids
-    
-    def forward(
-        self,
-        input_ids: torch.LongTensor = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        past_key_values = None,
-        inputs_embeds: Optional[torch.FloatTensor] = None,
-        labels: Optional[torch.LongTensor] = None,
-        use_cache: Optional[bool] = None,
-        output_attentions: Optional[bool] = None,
-        output_hidden_states: Optional[bool] = None,
-        return_dict: Optional[bool] = None,
-        cache_position: Optional[torch.LongTensor] = None,
-        num_logits_to_keep: int = 0,
-        **kwargs,
-    ) -> Union[Tuple, CausalLMOutputWithPast]:
-        
-        device = input_ids.device
-
-        if input_ids is not None and inputs_embeds is None and input_ids.size() == attention_mask.size(): # during inference, first time call forward
-            # move inside forward(), one-time creation
-            thought_token_id = torch.tensor([self.model.embed_tokens.num_embeddings - 1], device=input_ids.device, dtype=input_ids.dtype)
-            thought_token_embed = self.model.embed_tokens(thought_token_id.to(self.model.embed_tokens.weight.device)) #.to(inputs_embeds.dtype) #.detach()
-
-            for thought_idx in range(self.n_thought):
-                input_ids_for_mark = input_ids.clone()
-
-                if input_ids is not None and inputs_embeds is None and input_ids.size() == attention_mask.size():
-                    inputs_embeds, where_thought_ids = self.generate_embs(input_ids, None, attention_mask)
-                    # input_ids = None
-                else:
-                    inputs_embeds, where_thought_ids = self.generate_embs(input_ids_for_mark, inputs_embeds, attention_mask)
-
-                # update thought idx and attention mask
-                next_prefix_embeds = torch.zeros(inputs_embeds.shape[0], inputs_embeds.shape[1]+1, inputs_embeds.shape[2]).to(device).type_as(inputs_embeds) # (bs, seq_len+1, dim)
-                next_prefix_ids = torch.zeros(input_ids.shape[0], input_ids.shape[1]+1).to(device).type_as(input_ids) # next_prefix_ids add a new column
-            
-                where_thought_ids = where_thought_ids.clone()
-                where_thought_ids[:,1] = where_thought_ids[:,1] + 1
-                # where_thought_ids[:,1] += 1 # update thought ids idx
-
-                # next_labels = torch.cat([labels, labels[:,-1].unsqueeze(1)], dim=1)
-                next_labels = torch.ones(labels.shape[0], labels.shape[1]+1).type_as(labels) if labels is not None else None
-                next_attention_mask = torch.ones(attention_mask.shape[0], attention_mask.shape[1]+1).type_as(attention_mask)
-                
-                # update input_embeds, input_ids, labels, attention_mask
-                for idx, thought_id_idx in enumerate(where_thought_ids[:,1]):
-                    next_prefix_embeds[idx] = torch.cat([inputs_embeds[idx, :thought_id_idx, :], thought_token_embed, inputs_embeds[idx, thought_id_idx:, :]], dim=0) # update input_embeds
-                    next_prefix_ids[idx] = torch.cat([input_ids[idx, :thought_id_idx], thought_token_id, input_ids[idx, thought_id_idx:]], dim=0)  # update input_ids
-                    next_prefix_ids[idx, thought_id_idx-1] = 0
-                    next_attention_mask[idx] = torch.cat([attention_mask[idx, :thought_id_idx], torch.LongTensor([1]).type_as(attention_mask), attention_mask[idx, thought_id_idx:]], dim=0) # update attention mask
-                    if labels is not None:
-                        next_labels[idx] = torch.cat([labels[idx, :thought_id_idx], torch.LongTensor([-100]).type_as(labels), labels[idx, thought_id_idx:]])             
-                        next_labels[idx, thought_id_idx] = -100 # update labels
-
-                input_ids = next_prefix_ids.clone()
-                inputs_embeds = next_prefix_embeds.clone()
-                labels = next_labels.clone() if labels is not None else None
-                attention_mask = next_attention_mask.clone()
-
-                if position_ids is not None:
-                    next_pos = position_ids[:, -1:] + 1  
-                    position_ids = torch.cat([position_ids, next_pos], dim=1)
-                if cache_position is not None:
-                    next_cache = cache_position[-1:] + 1  
-                    cache_position = torch.cat([cache_position, next_cache], dim=0)
-
-            input_ids = None # clear after reasoning for item title generation
-
-        # during inference, kv cache is on
-        return Qwen2ForCausalLM.forward(
-            self,
-            input_ids=input_ids,
-            attention_mask=attention_mask, # (bs, seq_len+n_thought)
-            position_ids=position_ids,
-            past_key_values=past_key_values,
-            inputs_embeds=inputs_embeds, # (bs, seq_len+n_thought, dim)
-            labels=labels,
-            use_cache=use_cache,
-            output_attentions=output_attentions,
-            output_hidden_states=output_hidden_states,
-            return_dict=return_dict,
-            cache_position=cache_position,
-            num_logits_to_keep=num_logits_to_keep,
-            **kwargs,
-        )
 
 class LatentModelwithVerifier_RATT_MS(LatentModelwithVerifier_RATT):
     '''
@@ -896,14 +588,15 @@ class LatentModelwithVerifier_RATT_MS(LatentModelwithVerifier_RATT):
         v_logits = torch.cat(v_logits, dim=0) # (n_verifier, bs, n_cat)
 
         v_probs = F.softmax(v_logits, dim=-1) # (n_verifier, bs, n_cat)
+        # evaluation feedback f_i via entropy (Eq. 8)
         entropy = -torch.sum(v_probs * torch.log(v_probs + 1e-12), dim=-1)  # (n_verifier, bs)
         max_entropy = torch.log(torch.tensor(v_probs.size(-1), dtype=torch.float, device=v_probs.device))
         weight = torch.mean(entropy / max_entropy, dim=0)  # (bs,)
-        if strategy == "max": # TODO: can be the mix of topK rather than top1; can be the prob * emb combination
+        if strategy == "max": 
             # verifier average
-            v_probs_mean = v_probs.mean(dim=0)  # (bs, n_cat) 
+            v_probs_mean = v_probs.mean(dim=0)  # (bs, n_cat)
             max_prob, max_prob_idx = v_probs_mean.max(dim=-1)  # (bs,)
-            # guidance embedding
+            # guidance vector g_i = verifier's last-layer weight prototype (Eq. 9)
             weight_matrix = self.verifiers[0].weight  # (n_cat, dim)
             guidance_emb = weight_matrix[max_prob_idx]  # (bs, dim)
         
@@ -928,9 +621,10 @@ class LatentModelwithVerifier_RATT_MS(LatentModelwithVerifier_RATT):
         thought_embeds = self.attention(
             hidden_states=hidden_states, attention_mask=attention_mask,
             thought_id_idx=where_thought_ids[:, 1],
-        ).to(input_embs.dtype) # TODO: (bs, dim)
+        ).to(input_embs.dtype) # (bs, dim)
         
         weight, guidance_emb, entropy = self.verify(thought_embeds, strategy="max")
+        # confidence-guided adjustment r* (Eq. 10)
         input_embs[where_thought_ids[:, 0], where_thought_ids[:, 1]] = (1-weight.unsqueeze(1).to(dtype=input_embs.dtype)) * thought_embeds + weight.unsqueeze(1).to(dtype=input_embs.dtype) * guidance_emb
         return input_embs, where_thought_ids, thought_embeds, guidance_emb, entropy
     
@@ -975,18 +669,19 @@ class LatentModelwithVerifier_RATT_MS(LatentModelwithVerifier_RATT):
                 else:
                     difference = H - H_last
                     H_last = H
+                    # monotonicity regularization (Eq. 13)
                     loss_mono += torch.exp(torch.mean(torch.clamp_min(difference.squeeze(0), 0.0)))
 
                 # update thought idx and attention mask
                 next_prefix_embeds = torch.zeros(inputs_embeds.shape[0], inputs_embeds.shape[1]+1, inputs_embeds.shape[2]).to(device).type_as(inputs_embeds) # (bs, seq_len+1, dim)
                 next_prefix_ids = torch.zeros(input_ids.shape[0], input_ids.shape[1]+1).to(device).type_as(input_ids) # next_prefix_ids add a new column
-            
+
                 where_thought_ids = where_thought_ids.clone()
                 where_thought_ids[:,1] = where_thought_ids[:,1] + 1
 
                 next_labels = torch.ones(labels.shape[0], labels.shape[1]+1).type_as(labels) if labels is not None else None
                 next_attention_mask = torch.ones(attention_mask.shape[0], attention_mask.shape[1]+1).type_as(attention_mask)
-                
+
                 # update input_embeds, input_ids, labels, attention_mask
                 for idx, thought_id_idx in enumerate(where_thought_ids[:,1]):
                     next_prefix_embeds[idx] = torch.cat([inputs_embeds[idx, :thought_id_idx, :], thought_token_embed, inputs_embeds[idx, thought_id_idx:, :]], dim=0) # update input_embeds
@@ -994,7 +689,7 @@ class LatentModelwithVerifier_RATT_MS(LatentModelwithVerifier_RATT):
                     next_prefix_ids[idx, thought_id_idx-1] = 0
                     next_attention_mask[idx] = torch.cat([attention_mask[idx, :thought_id_idx], torch.LongTensor([1]).type_as(attention_mask), attention_mask[idx, thought_id_idx:]], dim=0) # update attention mask
                     if labels is not None:
-                        next_labels[idx] = torch.cat([labels[idx, :thought_id_idx], torch.LongTensor([-100]).type_as(labels), labels[idx, thought_id_idx:]])             
+                        next_labels[idx] = torch.cat([labels[idx, :thought_id_idx], torch.LongTensor([-100]).type_as(labels), labels[idx, thought_id_idx:]])
                         next_labels[idx, thought_id_idx] = -100 # update labels
 
                 input_ids = next_prefix_ids.clone()
@@ -1003,21 +698,21 @@ class LatentModelwithVerifier_RATT_MS(LatentModelwithVerifier_RATT):
                 attention_mask = next_attention_mask.clone()
 
                 if position_ids is not None:
-                    next_pos = position_ids[:, -1:] + 1  
+                    next_pos = position_ids[:, -1:] + 1
                     position_ids = torch.cat([position_ids, next_pos], dim=1)
                 if cache_position is not None:
-                    next_cache = cache_position[-1:] + 1  
+                    next_cache = cache_position[-1:] + 1
                     cache_position = torch.cat([cache_position, next_cache], dim=0)
                 all_thought_embeds.append(thought_embeds.unsqueeze(0)) # collect all thoughts embeds for classification loss
             input_ids = None # clear after reasoning for item title generation
 
-            # verifier classification loss
+            # verifier loss (Eq. 11)
             all_thought_embeds = torch.cat(all_thought_embeds, dim=0) # (n_thoughts, bs, dim)
             output_logits = []
             for v_idx in range(self.num_verifier):
                 output_logits.append(self.verifiers[v_idx](all_thought_embeds).unsqueeze(2)) # (n_thoughts, bs, 1, n_cat)
-            
-            output_logits = torch.cat(output_logits, dim=2) # (n_thoughts, bs, n_verifier, n_cat) 
+
+            output_logits = torch.cat(output_logits, dim=2) # (n_thoughts, bs, n_verifier, n_cat)
             output_logits = output_logits.view(self.n_thought, -1, self.num_category) # (n_thoughts, bs*n_verifier, n_cat)
 
             v_loss = 0
@@ -1034,6 +729,7 @@ class LatentModelwithVerifier_RATT_MS(LatentModelwithVerifier_RATT):
                 v_labels = v_labels.view(-1) # (n_thoughts * bs * n_verifier)
                 v_loss = loss_func(output_logits, v_labels)
 
+            # overall loss = rec loss + beta * verifier loss + gamma * monotonicity reg (Eq. 14)
             v_loss += self.mono_weight * loss_mono
 
         # during inference, kv cache is on
@@ -1102,8 +798,10 @@ class LatentModelwithVerifier_RATT_MS(LatentModelwithVerifier_RATT):
 
         loss = None
         if labels is not None:
+            # recommendation loss (Eq. 12)
             loss = self.loss_function(logits=logits, labels=labels, vocab_size=self.config.vocab_size, **kwargs)
-            loss = loss + self.v_weight * v_loss # add LLM rec loss and verifier loss
+            # overall loss: rec loss + verifier loss (incl. monotonicity reg) (Eq. 14)
+            loss = loss + self.v_weight * v_loss
 
         if not return_dict:
             output = (logits,) + outputs[1:]
@@ -1525,7 +1223,7 @@ class LatentModelwithVerifier_RATT_MS(LatentModelwithVerifier_RATT):
                 inputs_tensor, generation_config, model_kwargs
             )
         elif kwargs_has_attention_mask:
-            # TODO (joao): generalize this check with other types of inputs
+            # (joao): generalize this check with other types of inputs
             if model_input_name == "input_ids" and len(model_kwargs["attention_mask"].shape) > 2:
                 raise ValueError("`attention_mask` passed to `generate` must be 2D.")
 
@@ -1976,11 +1674,11 @@ class LatentModelwithVerifier_RATT_MS_MoV(LatentModelwithVerifier_RATT_MS):
         self.v_weight = config.v_weight if "v_weight" in config else 0
         self.neg_weight = config.neg_weight if "neg_weight" in config else 0
         
-        # k differnet expert
+        # mixture of verifiers, one head per aspect (Eq. 5)
         self.verifiers = nn.ModuleList([
             nn.Linear(self.hidden_size, out_dim) for out_dim in self.verifier_dims
         ])
-        # singel gate：hidden -> k
+        # personalized router g(.) (Eq. 6)
         self.gate = nn.Linear(self.hidden_size, self.num_verifier)
 
     def setup_verifier(self, config):
@@ -1996,6 +1694,7 @@ class LatentModelwithVerifier_RATT_MS_MoV(LatentModelwithVerifier_RATT_MS):
         bs, _ = thought_embeds.shape
         eps = 1e-12
 
+        # personalized router weights w_i (Eq. 6)
         gate_w = F.softmax(self.gate(thought_embeds), dim=-1) # (bs, k)
 
         probs_list = []    # (bs, n_cat_i)
@@ -2003,14 +1702,16 @@ class LatentModelwithVerifier_RATT_MS_MoV(LatentModelwithVerifier_RATT_MS):
         guid_list = []     # (bs, dim)
 
         for i, v in enumerate(self.verifiers):
+            # multi-dimensional evaluation: per-aspect verifier V_i (Eq. 5)
             logits_i = v(thought_embeds)                 # (bs, n_cat_i)
             probs_i  = F.softmax(logits_i, dim=-1)
             probs_list.append(probs_i)
 
+            # evaluation feedback f_i via entropy (Eq. 8)
             ent_i = -torch.sum(probs_i * torch.log(probs_i + eps), dim=-1)  # (bs,)
             entropy_list.append(ent_i)
 
-            # guidance: 取该 expert 概率最大的类别，对应 Linear 的权重行
+            # guidance vector g_i = verifier's last-layer weight prototype (Eq. 9)
             idx_i = torch.argmax(probs_i, dim=-1)        # (bs,)
             Wi = v.weight                                # (n_cat_i, dim)
             guid_i = Wi[idx_i]                           # (bs, dim)
@@ -2020,17 +1721,18 @@ class LatentModelwithVerifier_RATT_MS_MoV(LatentModelwithVerifier_RATT_MS):
         entropy_mat = torch.stack(entropy_list, dim=0)        # (k, bs)
         guidance_stack = torch.stack(guid_list, dim=1)        # (bs, k, dim)
 
-        # 归一化熵并 gate 加权 -> 融合 weight
-        # 每个 expert 用自己的 log(n_cat_i) 归一化
+        # normalize entropy and weight it by the gate -> fused weight
+        # each expert is normalized by its own log(n_cat_i)
         denom = torch.tensor(
             [max(1, d) for d in self.verifier_dims],
             device=thought_embeds.device, dtype=thought_embeds.dtype
         )
         denom = torch.log(denom) + eps                         # (k,)
         norm_entropy = entropy_mat / denom.view(-1, 1)         # (k, bs)
+        # router-weighted confidence score (Eq. 10)
         weight = torch.sum(gate_w.transpose(0,1) * norm_entropy, dim=0)  # (bs,)
 
-        # weighted guidance
+        # router-weighted guidance vector (Eq. 9, 10)
         guidance_emb = torch.sum(gate_w.unsqueeze(-1) * guidance_stack, dim=1).to(thought_embeds.dtype)  # (bs, dim)
 
         return weight, guidance_emb, entropy_mat, gate_w
@@ -2052,9 +1754,10 @@ class LatentModelwithVerifier_RATT_MS_MoV(LatentModelwithVerifier_RATT_MS):
         thought_embeds = self.attention(
             hidden_states=hidden_states, attention_mask=attention_mask,
             thought_id_idx=where_thought_ids[:, 1],
-        ).to(input_embs.dtype) # TODO: (bs, dim)
+        ).to(input_embs.dtype) # (bs, dim)
         
         weight, guidance_emb, entropy, gate_w = self.verify(thought_embeds)
+        # confidence-guided adjustment r* (Eq. 10)
         input_embs[where_thought_ids[:, 0], where_thought_ids[:, 1]] = (1-weight.unsqueeze(1).to(dtype=input_embs.dtype)) * thought_embeds + weight.unsqueeze(1).to(dtype=input_embs.dtype) * guidance_emb
         return input_embs, where_thought_ids, thought_embeds, guidance_emb, entropy, gate_w
     
@@ -2100,12 +1803,13 @@ class LatentModelwithVerifier_RATT_MS_MoV(LatentModelwithVerifier_RATT_MS):
                 else:
                     difference = H - H_last
                     H_last = H
+                    # monotonicity regularization (Eq. 13)
                     loss_mono += torch.exp(torch.mean(torch.clamp_min(difference.squeeze(0), 0.0)))
 
                 # update thought idx and attention mask
                 next_prefix_embeds = torch.zeros(inputs_embeds.shape[0], inputs_embeds.shape[1]+1, inputs_embeds.shape[2]).to(device).type_as(inputs_embeds) # (bs, seq_len+1, dim)
                 next_prefix_ids = torch.zeros(input_ids.shape[0], input_ids.shape[1]+1).to(device).type_as(input_ids) # next_prefix_ids add a new column
-            
+
                 where_thought_ids = where_thought_ids.clone()
                 where_thought_ids[:,1] = where_thought_ids[:,1] + 1
 
@@ -2137,7 +1841,7 @@ class LatentModelwithVerifier_RATT_MS_MoV(LatentModelwithVerifier_RATT_MS):
                 all_entropy.append(H.unsqueeze(0)) # (1, n_verifier, bs)
             input_ids = None # clear after reasoning for item title generation
 
-            # === Verifier Loss: sum_k gate_w_k * CE_k ===
+            # verifier loss (Eq. 11), router-weighted across verifiers
             all_thought_embeds = torch.cat(all_thought_embeds, dim=0)  # (n_thoughts, bs, dim)
             n_thoughts, bs, _ = all_thought_embeds.shape
 
@@ -2166,6 +1870,7 @@ class LatentModelwithVerifier_RATT_MS_MoV(LatentModelwithVerifier_RATT_MS):
 
                 v_loss = (nll * correct_tensor).mean()
 
+                # overall loss = rec loss + beta * verifier loss + gamma * monotonicity reg (Eq. 14)
                 v_loss += self.mono_weight * loss_mono
 
         # during inference, kv cache is on

@@ -122,12 +122,7 @@ def train(
     # stage 2: freeze the reasoning LLM (+RATT), train only the verifier
     model.freeze_llm_params()
 
-    ##################
-    ##############################################################################
-    if model_class == "LatentModelwithVerifier":
-        Customize_Dataset = RecDataset  
-    else:
-        Customize_Dataset = LatentRDataset_Pretrain
+    Customize_Dataset = LatentRDataset_Pretrain
 
     train_data = Customize_Dataset(train_file=train_file, asin2catid_file=asin2catid_file, asin2clusterid_file=asin2clusterid_file, tokenizer=tokenizer, max_len=cutoff_len,  sample=sample, seed=seed, category=category, K = K)
     val_data = Customize_Dataset(train_file=eval_file, asin2catid_file=asin2catid_file, asin2clusterid_file=asin2clusterid_file, tokenizer=tokenizer, max_len=cutoff_len,  sample=sample, category=category, K = K)

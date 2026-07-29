@@ -66,10 +66,7 @@ def main(
     tokenizer.pad_token_id = tokenizer.eos_token_id
     tokenizer.padding_side = "left"
 
-    if model_class == "LatentModelwithVerifier":
-        Customize_Dataset = RecDataset 
-    else:
-        Customize_Dataset = LatentRDataset_Pretrain
+    Customize_Dataset = LatentRDataset_Pretrain
     val_dataset = Customize_Dataset(train_file=test_data_path, asin2catid_file=asin2catid_file, asin2clusterid_file=asin2clusterid_file, tokenizer=tokenizer, max_len=512,  sample=sample, category=category, test=True, K = 4)
 
         

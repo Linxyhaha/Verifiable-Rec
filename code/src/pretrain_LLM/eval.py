@@ -6,7 +6,7 @@ sys.path.insert(0, current_dir)
 import torch
 import json
 from transformers import GenerationConfig,  AutoTokenizer, AutoConfig
-from layers import LatentModel, LatentModel_MS
+from layers import LatentModel_MS
 from reasoning_dataset import  LatentRDataset
 from transformers import  LogitsProcessorList, TemperatureLogitsWarper
 from LogitProcesser import CFEnhancedLogitsProcessor, get_hash, get_prefix_data
@@ -125,12 +125,7 @@ def main(
             )
     
         s = generation_output.sequences[:, minLen-5:]
-        # sequence_scores = [[0 for i in range(len(generation_output.scores))] for _ in range(num_beams)]
-        # for i in range(num_beams):
-        #     for j in range(L, len(generation_output.sequences[i])):
-        #         beam_index = generation_output.beam_indices[i][j - L]
-        #         if beam_index != -1:
-        #             sequence_scores[i][j - L] = generation_output.scores[j - L][beam_index][generation_output.sequences[i][j]].item()
+
         scores = generation_output.sequences_scores.tolist()
         output = tokenizer.batch_decode(s, skip_special_tokens=True)
         output = [_.split("Response:")[-1] for _ in output]
